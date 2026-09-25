@@ -1,6 +1,10 @@
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+import uvicorn
 import os
 import imaplib
 import email
+import hmac
 from email.header import decode_header
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -25,6 +29,7 @@ IMAP_HOST = os.environ.get("IMAP_HOST", "imap.ionos.fr")
 IMAP_PORT = int(os.environ.get("IMAP_PORT", "993"))
 EMAIL_USER = os.environ.get("EMAIL_USER")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
+MCP_API_KEY = os.environ.get("MCP_API_KEY")
 
 
 def connect_imap():
@@ -169,10 +174,32 @@ def search_emails(query: str, limit: int = 10) -> str:
             pass
 
 
+class APIKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        if request.url.path.startswith("/mcp"):
+            provided_key = request.headers.get("X-API-Key", "")
+
+            if not MCP_API_KEY or not hmac.compare_digest(
+                provided_key,
+                MCP_API_KEY
+            ):
+                return JSONResponse(
+                    {"error": "Unauthorized"},
+                    status_code=401
+                )
+
+        return await call_next(request)
+
+
+app = mcp.streamable_http_app()
+app.add_middleware(APIKeyMiddleware)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
 
-    mcp.settings.host = "0.0.0.0"
-    mcp.settings.port = port
-
-    mcp.run(transport="streamable-http")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port
+    )
