@@ -315,6 +315,134 @@ def list_attachments(message_id: str) -> str:
             mail.logout()
         except Exception:
             pass
+@mcp.tool()
+def read_attachment(message_id: str, attachment_id: int) -> str:
+    """Lit le contenu d'une pièce jointe PDF, DOCX, XLSX, CSV ou TXT."""
+
+    import io
+    import csv
+    from pypdf import PdfReader
+    from docx import Document
+    from openpyxl import load_workbook
+
+    mail = connect_imap()
+
+    try:
+        mail.select("INBOX", readonly=True)
+        status, msg_data = mail.fetch(message_id, "(RFC822)")
+
+        if status != "OK":
+            return "Impossible de récupérer cet email."
+
+        raw_email = next(
+            (item[1] for item in msg_data if isinstance(item, tuple)),
+            None,
+        )
+
+        if not raw_email:
+            return "Email introuvable."
+
+        msg = email.message_from_bytes(raw_email)
+
+        parts = list(msg.walk())
+
+        if attachment_id < 0 or attachment_id >= len(parts):
+            return "Identifiant de pièce jointe invalide."
+
+        part = parts[attachment_id]
+        filename = part.get_filename()
+
+        if not filename:
+            return "Cette partie du message n'est pas une pièce jointe."
+
+        filename = decode_text(filename)
+        data = part.get_payload(decode=True)
+
+        if not data:
+            return "La pièce jointe est vide."
+
+        # Limite de sécurité : 10 Mo
+        if len(data) > 10 * 1024 * 1024:
+            return "Pièce jointe trop volumineuse (limite : 10 Mo)."
+
+        extension = filename.lower().rsplit(".", 1)[-1]
+
+        if extension == "pdf":
+            reader = PdfReader(io.BytesIO(data))
+            text = "\n\n".join(
+                page.extract_text() or ""
+                for page in reader.pages
+            )
+
+        elif extension == "docx":
+            document = Document(io.BytesIO(data))
+            text = "\n".join(
+                paragraph.text
+                for paragraph in document.paragraphs
+            )
+
+        elif extension == "xlsx":
+            workbook = load_workbook(
+                io.BytesIO(data),
+                read_only=True,
+                data_only=True
+            )
+
+            output = []
+
+            for sheet in workbook.worksheets:
+                output.append(f"Feuille: {sheet.title}")
+
+                for row in sheet.iter_rows(values_only=True):
+                    output.append(
+                        " | ".join(
+                            "" if value is None else str(value)
+                            for value in row
+                        )
+                    )
+
+            text = "\n".join(output)
+
+        elif extension == "csv":
+            decoded = data.decode("utf-8-sig", errors="replace")
+            rows = csv.reader(io.StringIO(decoded))
+
+            text = "\n".join(
+                " | ".join(row)
+                for row in rows
+            )
+
+        elif extension in ("txt", "md"):
+            text = data.decode("utf-8", errors="replace")
+
+        else:
+            return (
+                f"Format non pris en charge : {filename}. "
+                "Formats acceptés : PDF, DOCX, XLSX, CSV, TXT et MD."
+            )
+
+        # Évite d'envoyer une quantité énorme de texte à Claude
+        max_chars = 100_000
+
+        if len(text) > max_chars:
+            text = (
+                text[:max_chars]
+                + "\n\n[Contenu tronqué après 100 000 caractères]"
+            )
+
+        return (
+            f"Fichier: {filename}\n\n"
+            f"{text.strip() or '[Aucun texte extractible]'}"
+        )
+
+    except Exception as exc:
+        return f"Impossible de lire la pièce jointe : {type(exc).__name__}"
+
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
             
 class APIKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
