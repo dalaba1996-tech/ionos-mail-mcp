@@ -99,10 +99,11 @@ def recent_emails(limit: int = 10) -> str:
             msg = email.message_from_bytes(raw)
 
             results.append(
-                f"De: {decode_text(msg.get('From'))}\n"
-                f"Objet: {decode_text(msg.get('Subject'))}\n"
-                f"Date: {msg.get('Date', '')}"
-            )
+    f"ID: {message_id.decode()}\n"
+    f"De: {decode_text(msg.get('From'))}\n"
+    f"Objet: {decode_text(msg.get('Subject'))}\n"
+    f"Date: {msg.get('Date', '')}"
+)
 
         return "\n\n---\n\n".join(results) or "Aucun email trouvé."
 
@@ -160,11 +161,11 @@ def search_emails(query: str, limit: int = 10) -> str:
             msg = email.message_from_bytes(raw)
 
             results.append(
-                f"De: {decode_text(msg.get('From'))}\n"
-                f"Objet: {decode_text(msg.get('Subject'))}\n"
-                f"Date: {msg.get('Date', '')}"
-            )
-
+    f"ID: {message_id.decode()}\n"
+    f"De: {decode_text(msg.get('From'))}\n"
+    f"Objet: {decode_text(msg.get('Subject'))}\n"
+    f"Date: {msg.get('Date', '')}"
+)
         return "\n\n---\n\n".join(results) or "Aucun email trouvé."
 
     finally:
@@ -173,7 +174,93 @@ def search_emails(query: str, limit: int = 10) -> str:
         except Exception:
             pass
 
+@mcp.tool()
+def read_email(message_id: str) -> str:
+    """Lit le contenu complet d'un email IONOS à partir de son identifiant."""
 
+    mail = connect_imap()
+
+    try:
+        mail.select("INBOX", readonly=True)
+
+        status, msg_data = mail.fetch(message_id, "(RFC822)")
+
+        if status != "OK":
+            return "Impossible de récupérer cet email."
+
+        raw_email = next(
+            (
+                item[1]
+                for item in msg_data
+                if isinstance(item, tuple)
+            ),
+            None,
+        )
+
+        if not raw_email:
+            return "Email introuvable."
+
+        msg = email.message_from_bytes(raw_email)
+
+        sender = decode_text(msg.get("From"))
+        recipient = decode_text(msg.get("To"))
+        subject = decode_text(msg.get("Subject"))
+        date = msg.get("Date", "")
+
+        body = ""
+
+        if msg.is_multipart():
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                disposition = str(
+                    part.get("Content-Disposition", "")
+                ).lower()
+
+                # On ignore les pièces jointes pour l'instant
+                if "attachment" in disposition:
+                    continue
+
+                if content_type == "text/plain":
+                    payload = part.get_payload(decode=True)
+
+                    if payload:
+                        charset = part.get_content_charset() or "utf-8"
+                        body = payload.decode(
+                            charset,
+                            errors="replace"
+                        )
+                        break
+
+        else:
+            payload = msg.get_payload(decode=True)
+
+            if payload:
+                charset = msg.get_content_charset() or "utf-8"
+                body = payload.decode(
+                    charset,
+                    errors="replace"
+                )
+
+        if not body.strip():
+            body = (
+                "Le message ne contient pas de version texte "
+                "directement lisible."
+            )
+
+        return (
+            f"De: {sender}\n"
+            f"À: {recipient}\n"
+            f"Objet: {subject}\n"
+            f"Date: {date}\n\n"
+            f"Contenu:\n{body.strip()}"
+        )
+
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+            
 class APIKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         if request.url.path.startswith("/mcp"):
