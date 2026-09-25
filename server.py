@@ -443,6 +443,90 @@ def read_attachment(message_id: str, attachment_id: int) -> str:
             mail.logout()
         except Exception:
             pass
+@mcp.tool()
+def create_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = ""
+) -> str:
+    """Crée un brouillon dans la boîte IONOS sans envoyer l'email."""
+
+    from email.message import EmailMessage
+    from email.utils import formatdate
+    import time
+
+    mail = connect_imap()
+
+    try:
+        # Cherche le dossier Brouillons disponible sur la boîte IONOS
+        status, folders = mail.list()
+
+        if status != "OK":
+            return "Impossible d'accéder aux dossiers de la boîte mail."
+
+        draft_folder = None
+
+        for folder in folders:
+            folder_text = folder.decode(errors="replace")
+
+            # IONOS peut utiliser différents noms selon la configuration
+            if (
+                "\\Drafts" in folder_text
+                or '"Drafts"' in folder_text
+                or '"Brouillons"' in folder_text
+            ):
+                # Le nom du dossier est généralement le dernier élément
+                draft_folder = folder_text.split(' "/" ')[-1].strip('"')
+                break
+
+        if not draft_folder:
+            return (
+                "Impossible de trouver automatiquement le dossier "
+                "Brouillons/Drafts de cette boîte IONOS."
+            )
+
+        msg = EmailMessage()
+
+        msg["From"] = EMAIL_USER
+        msg["To"] = to
+
+        if cc.strip():
+            msg["Cc"] = cc
+
+        msg["Subject"] = subject
+        msg["Date"] = formatdate(localtime=True)
+
+        msg.set_content(body)
+
+        status, _ = mail.append(
+            draft_folder,
+            "\\Draft",
+            imaplib.Time2Internaldate(time.time()),
+            msg.as_bytes()
+        )
+
+        if status != "OK":
+            return "IONOS n'a pas pu enregistrer le brouillon."
+
+        return (
+            "Brouillon créé avec succès.\n"
+            f"À: {to}\n"
+            f"Objet: {subject}\n"
+            "Le message n'a PAS été envoyé."
+        )
+
+    except Exception as exc:
+        return (
+            "Impossible de créer le brouillon : "
+            f"{type(exc).__name__}"
+        )
+
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
             
 class APIKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
