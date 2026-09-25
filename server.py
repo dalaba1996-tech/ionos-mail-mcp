@@ -261,6 +261,61 @@ def read_email(message_id: str) -> str:
         except Exception:
             pass
             
+@mcp.tool()
+def list_attachments(message_id: str) -> str:
+    """Liste les pièces jointes présentes dans un email IONOS."""
+
+    mail = connect_imap()
+
+    try:
+        mail.select("INBOX", readonly=True)
+
+        status, msg_data = mail.fetch(message_id, "(RFC822)")
+
+        if status != "OK":
+            return "Impossible de récupérer cet email."
+
+        raw_email = next(
+            (
+                item[1]
+                for item in msg_data
+                if isinstance(item, tuple)
+            ),
+            None,
+        )
+
+        if not raw_email:
+            return "Email introuvable."
+
+        msg = email.message_from_bytes(raw_email)
+
+        attachments = []
+
+        for index, part in enumerate(msg.walk()):
+            filename = part.get_filename()
+
+            if filename:
+                filename = decode_text(filename)
+
+                attachments.append(
+                    f"ID pièce jointe: {index}\n"
+                    f"Nom: {filename}\n"
+                    f"Type: {part.get_content_type()}\n"
+                    f"Taille: "
+                    f"{len(part.get_payload(decode=True) or b'')} octets"
+                )
+
+        if not attachments:
+            return "Cet email ne contient aucune pièce jointe."
+
+        return "\n\n---\n\n".join(attachments)
+
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+            
 class APIKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         if request.url.path.startswith("/mcp"):
