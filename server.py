@@ -3,11 +3,22 @@ import imaplib
 import email
 from email.header import decode_header
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 mcp = FastMCP(
     "IONOS Mail",
     stateless_http=True,
     json_response=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "ionos-mail-mcp-1.onrender.com",
+            "ionos-mail-mcp-1.onrender.com:*",
+        ],
+        allowed_origins=[
+            "https://ionos-mail-mcp-1.onrender.com",
+        ],
+    ),
 )
 
 IMAP_HOST = os.environ.get("IMAP_HOST", "imap.ionos.fr")
