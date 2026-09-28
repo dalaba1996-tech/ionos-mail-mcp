@@ -529,17 +529,17 @@ def create_draft(
             pass
 
 @mcp.tool()
-def create_draft_with_attachment(
+def create_draft_with_attachments(
     to: str,
     subject: str,
     body: str,
     source_message_id: str,
-    attachment_id: int,
+    attachment_ids: list[int],
     cc: str = ""
 ) -> str:
     """
-    Crée un brouillon IONOS avec une pièce jointe provenant
-    d'un email existant. Le message n'est pas envoyé.
+    Crée un brouillon IONOS avec une ou plusieurs pièces jointes
+    provenant d'un même email existant. Le message n'est pas envoyé.
     """
 
     from email.message import EmailMessage
@@ -550,7 +550,7 @@ def create_draft_with_attachment(
     mail = connect_imap()
 
     try:
-        # 1. Récupérer l'email contenant la pièce jointe
+        # Récupération du mail source
         mail.select("INBOX", readonly=True)
 
         status, msg_data = mail.fetch(
@@ -576,27 +576,75 @@ def create_draft_with_attachment(
         source_msg = email.message_from_bytes(raw_email)
         parts = list(source_msg.walk())
 
-        if attachment_id < 0 or attachment_id >= len(parts):
-            return "Identifiant de pièce jointe invalide."
+        if not attachment_ids:
+            return "Aucune pièce jointe sélectionnée."
 
-        part = parts[attachment_id]
+        # Construction du brouillon
+        msg = EmailMessage()
 
-        filename = part.get_filename()
+        msg["From"] = EMAIL_USER
+        msg["To"] = to
 
-        if not filename:
-            return "Cette partie du mail n'est pas une pièce jointe."
+        if cc.strip():
+            msg["Cc"] = cc
 
-        filename = decode_text(filename)
-        attachment_data = part.get_payload(decode=True)
+        msg["Subject"] = subject
+        msg["Date"] = formatdate(localtime=True)
+        msg.set_content(body)
 
-        if not attachment_data:
-            return "La pièce jointe est vide."
+        attached_files = []
+        total_size = 0
 
-        # Limite de sécurité
-        if len(attachment_data) > 10 * 1024 * 1024:
-            return "Pièce jointe trop volumineuse (limite : 10 Mo)."
+        for attachment_id in attachment_ids:
 
-        # 2. Trouver le dossier Brouillons
+            if attachment_id < 0 or attachment_id >= len(parts):
+                return (
+                    f"Identifiant de pièce jointe invalide : "
+                    f"{attachment_id}"
+                )
+
+            part = parts[attachment_id]
+            filename = part.get_filename()
+
+            if not filename:
+                return (
+                    f"La partie {attachment_id} n'est pas "
+                    "une pièce jointe."
+                )
+
+            filename = decode_text(filename)
+            attachment_data = part.get_payload(decode=True)
+
+            if not attachment_data:
+                return f"La pièce jointe {filename} est vide."
+
+            total_size += len(attachment_data)
+
+            # Limite totale : 20 Mo
+            if total_size > 20 * 1024 * 1024:
+                return (
+                    "Les pièces jointes dépassent la limite "
+                    "totale de 20 Mo."
+                )
+
+            content_type = (
+                part.get_content_type()
+                or mimetypes.guess_type(filename)[0]
+                or "application/octet-stream"
+            )
+
+            maintype, subtype = content_type.split("/", 1)
+
+            msg.add_attachment(
+                attachment_data,
+                maintype=maintype,
+                subtype=subtype,
+                filename=filename
+            )
+
+            attached_files.append(filename)
+
+        # Recherche du dossier Brouillons
         status, folders = mail.list()
 
         if status != "OK":
@@ -622,37 +670,7 @@ def create_draft_with_attachment(
         if not draft_folder:
             return "Dossier Brouillons/Drafts introuvable."
 
-        # 3. Construire le nouveau mail
-        msg = EmailMessage()
-
-        msg["From"] = EMAIL_USER
-        msg["To"] = to
-
-        if cc.strip():
-            msg["Cc"] = cc
-
-        msg["Subject"] = subject
-        msg["Date"] = formatdate(localtime=True)
-
-        msg.set_content(body)
-
-        # Déterminer le type de fichier
-        content_type = (
-            part.get_content_type()
-            or mimetypes.guess_type(filename)[0]
-            or "application/octet-stream"
-        )
-
-        maintype, subtype = content_type.split("/", 1)
-
-        msg.add_attachment(
-            attachment_data,
-            maintype=maintype,
-            subtype=subtype,
-            filename=filename
-        )
-
-        # 4. Enregistrer uniquement dans Brouillons
+        # Enregistrement du brouillon
         status, _ = mail.append(
             draft_folder,
             "\\Draft",
@@ -663,17 +681,23 @@ def create_draft_with_attachment(
         if status != "OK":
             return "IONOS n'a pas pu enregistrer le brouillon."
 
+        files_list = "\n".join(
+            f"- {filename}"
+            for filename in attached_files
+        )
+
         return (
-            "Brouillon créé avec succès avec pièce jointe.\n"
+            "Brouillon créé avec succès.\n"
             f"À: {to}\n"
             f"Objet: {subject}\n"
-            f"Pièce jointe: {filename}\n"
+            f"Pièces jointes ({len(attached_files)}):\n"
+            f"{files_list}\n\n"
             "Le message n'a PAS été envoyé."
         )
 
     except Exception as exc:
         return (
-            "Impossible de créer le brouillon avec pièce jointe : "
+            "Impossible de créer le brouillon avec pièces jointes : "
             f"{type(exc).__name__}"
         )
 
