@@ -707,6 +707,127 @@ def create_draft_with_attachments(
         except Exception:
             pass
 
+
+@mcp.tool()
+def create_draft_with_upload(
+    to: str,
+    subject: str,
+    body: str,
+    filename: str,
+    file_base64: str,
+    content_type: str = "",
+    cc: str = ""
+) -> str:
+    """
+    Crée un brouillon IONOS avec une pièce jointe fournie directement
+    (encodée en base64), sans qu'elle vienne d'un mail existant.
+    Le message n'est pas envoyé.
+    """
+
+    import base64
+    from email.message import EmailMessage
+    from email.utils import formatdate
+    import mimetypes
+    import time
+
+    mail = connect_imap()
+
+    try:
+        try:
+            attachment_data = base64.b64decode(file_base64)
+        except Exception:
+            return "Le contenu de la pièce jointe n'est pas un base64 valide."
+
+        if not attachment_data:
+            return "La pièce jointe est vide."
+
+        # Limite : 20 Mo (même limite que create_draft_with_attachments)
+        if len(attachment_data) > 20 * 1024 * 1024:
+            return "Pièce jointe trop volumineuse (limite : 20 Mo)."
+
+        msg = EmailMessage()
+
+        msg["From"] = EMAIL_USER
+        msg["To"] = to
+
+        if cc.strip():
+            msg["Cc"] = cc
+
+        msg["Subject"] = subject
+        msg["Date"] = formatdate(localtime=True)
+        msg.set_content(body)
+
+        guessed_type = (
+            content_type
+            or mimetypes.guess_type(filename)[0]
+            or "application/octet-stream"
+        )
+        maintype, subtype = guessed_type.split("/", 1)
+
+        msg.add_attachment(
+            attachment_data,
+            maintype=maintype,
+            subtype=subtype,
+            filename=filename
+        )
+
+        # Recherche du dossier Brouillons
+        status, folders = mail.list()
+
+        if status != "OK":
+            return "Impossible d'accéder aux dossiers IONOS."
+
+        draft_folder = None
+
+        for folder in folders:
+            folder_text = folder.decode(errors="replace")
+
+            if (
+                "\\Drafts" in folder_text
+                or '"Drafts"' in folder_text
+                or '"Brouillons"' in folder_text
+            ):
+                draft_folder = (
+                    folder_text
+                    .split(' "/" ')[-1]
+                    .strip('"')
+                )
+                break
+
+        if not draft_folder:
+            return "Dossier Brouillons/Drafts introuvable."
+
+        # Enregistrement du brouillon
+        status, _ = mail.append(
+            draft_folder,
+            "\\Draft",
+            imaplib.Time2Internaldate(time.time()),
+            msg.as_bytes()
+        )
+
+        if status != "OK":
+            return "IONOS n'a pas pu enregistrer le brouillon."
+
+        return (
+            "Brouillon créé avec succès.\n"
+            f"À: {to}\n"
+            f"Objet: {subject}\n"
+            f"Pièce jointe: {filename}\n\n"
+            "Le message n'a PAS été envoyé."
+        )
+
+    except Exception as exc:
+        return (
+            "Impossible de créer le brouillon : "
+            f"{type(exc).__name__}"
+        )
+
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+            
 class APIKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         if request.url.path.startswith("/mcp"):
