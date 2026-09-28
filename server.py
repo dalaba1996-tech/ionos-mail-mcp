@@ -5,6 +5,10 @@ import os
 import imaplib
 import email
 import hmac
+import tempfile
+import uuid
+import json
+from pathlib import Path
 from email.header import decode_header
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -30,6 +34,8 @@ IMAP_PORT = int(os.environ.get("IMAP_PORT", "993"))
 EMAIL_USER = os.environ.get("EMAIL_USER")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 MCP_API_KEY = os.environ.get("MCP_API_KEY")
+UPLOAD_DIR = Path(tempfile.gettempdir()) / "ionos_mcp_uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def connect_imap():
@@ -709,44 +715,262 @@ def create_draft_with_attachments(
 
 
 @mcp.tool()
-def create_draft_with_upload(
-    to: str,
-    subject: str,
-    body: str,
+def start_upload(
     filename: str,
-    file_base64: str,
-    content_type: str = "",
-    cc: str = ""
+    mime_type: str,
+    total_size: int,
+    sha256: str
 ) -> str:
     """
-    Crée un brouillon IONOS avec une pièce jointe fournie directement
-    (encodée en base64), sans qu'elle vienne d'un mail existant.
-    Le message n'est pas envoyé.
+    Démarre l'envoi sécurisé d'un fichier en plusieurs morceaux.
+    Retourne un upload_id à utiliser pour les morceaux suivants.
+    """
+
+    # Limite totale : 20 Mo
+    max_size = 20 * 1024 * 1024
+
+    if total_size <= 0:
+        return "Erreur : taille de fichier invalide."
+
+    if total_size > max_size:
+        return "Erreur : fichier trop volumineux (limite : 20 Mo)."
+
+    # Évite qu'un nom de fichier puisse écrire ailleurs sur le serveur
+    safe_filename = Path(filename).name
+
+    if not safe_filename:
+        return "Erreur : nom de fichier invalide."
+
+    expected_hash = sha256.lower().strip()
+
+    if (
+        len(expected_hash) != 64
+        or any(c not in "0123456789abcdef" for c in expected_hash)
+    ):
+        return "Erreur : SHA-256 invalide."
+
+    upload_id = uuid.uuid4().hex
+
+    session_dir = UPLOAD_DIR / upload_id
+    session_dir.mkdir(parents=True, exist_ok=False)
+
+    metadata = {
+        "filename": safe_filename,
+        "mime_type": mime_type or "application/octet-stream",
+        "total_size": total_size,
+        "sha256": expected_hash,
+        "next_chunk": 0,
+    }
+
+    with open(session_dir / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f)
+
+    # Fichier vide qui recevra progressivement les données
+    (session_dir / "data.bin").touch()
+
+    return (
+        "Upload initialisé.\n"
+        f"upload_id: {upload_id}\n"
+        "Commence avec chunk_index: 0."
+    )
+            
+@mcp.tool()
+def append_chunk(
+    upload_id: str,
+    chunk_index: int,
+    data_base64: str
+) -> str:
+    """
+    Ajoute un morceau encodé en base64 à un upload en cours.
+    Les morceaux doivent être envoyés dans l'ordre.
     """
 
     import base64
+    import binascii
+
+    # Validation de l'identifiant
+    if (
+        len(upload_id) != 32
+        or any(c not in "0123456789abcdef" for c in upload_id)
+    ):
+        return "Erreur : upload_id invalide."
+
+    session_dir = UPLOAD_DIR / upload_id
+    metadata_path = session_dir / "metadata.json"
+    data_path = session_dir / "data.bin"
+
+    if not metadata_path.exists() or not data_path.exists():
+        return "Erreur : session d'upload introuvable ou expirée."
+
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+
+        expected_chunk = metadata.get("next_chunk", 0)
+
+        if chunk_index != expected_chunk:
+            return (
+                "Erreur : mauvais ordre des morceaux. "
+                f"Chunk attendu : {expected_chunk}."
+            )
+
+        # Limite par morceau : 32 Ko de données encodées
+        if len(data_base64) > 50_000:
+            return (
+                "Erreur : morceau trop volumineux. "
+                "Utilise des chunks plus petits."
+            )
+
+        try:
+            chunk_data = base64.b64decode(
+                data_base64,
+                validate=True
+            )
+        except (binascii.Error, ValueError):
+            return "Erreur : données base64 invalides."
+
+        if not chunk_data:
+            return "Erreur : morceau vide."
+
+        current_size = data_path.stat().st_size
+        new_size = current_size + len(chunk_data)
+
+        if new_size > metadata["total_size"]:
+            return (
+                "Erreur : les données reçues dépassent "
+                "la taille annoncée du fichier."
+            )
+
+        with open(data_path, "ab") as f:
+            f.write(chunk_data)
+
+        metadata["next_chunk"] = expected_chunk + 1
+
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f)
+
+        return (
+            f"Chunk {chunk_index} reçu correctement.\n"
+            f"Octets reçus : {new_size}/{metadata['total_size']}\n"
+            f"Prochain chunk : {metadata['next_chunk']}"
+        )
+
+    except Exception as exc:
+        return (
+            "Erreur pendant la réception du morceau : "
+            f"{type(exc).__name__}"
+        )
+
+@mcp.tool()
+def finish_upload(upload_id: str) -> str:
+    """
+    Termine un upload et vérifie la taille ainsi que le SHA-256
+    avant d'autoriser l'utilisation du fichier.
+    """
+
+    import hashlib
+
+    if (
+        len(upload_id) != 32
+        or any(c not in "0123456789abcdef" for c in upload_id)
+    ):
+        return "Erreur : upload_id invalide."
+
+    session_dir = UPLOAD_DIR / upload_id
+    metadata_path = session_dir / "metadata.json"
+    data_path = session_dir / "data.bin"
+
+    if not metadata_path.exists() or not data_path.exists():
+        return "Erreur : session d'upload introuvable ou expirée."
+
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+
+        actual_size = data_path.stat().st_size
+        expected_size = metadata["total_size"]
+
+        # Vérification de la taille
+        if actual_size != expected_size:
+            return (
+                "Upload incomplet.\n"
+                f"Taille attendue : {expected_size} octets\n"
+                f"Taille reçue : {actual_size} octets\n"
+                f"Prochain chunk attendu : "
+                f"{metadata.get('next_chunk', 0)}"
+            )
+
+        # Calcul SHA-256 du fichier réellement reconstruit
+        sha256 = hashlib.sha256()
+
+        with open(data_path, "rb") as f:
+            while True:
+                block = f.read(1024 * 1024)
+
+                if not block:
+                    break
+
+                sha256.update(block)
+
+        actual_hash = sha256.hexdigest()
+        expected_hash = metadata["sha256"]
+
+        if not hmac.compare_digest(actual_hash, expected_hash):
+            return (
+                "ERREUR : contrôle d'intégrité échoué.\n"
+                "Le fichier reconstruit ne correspond pas "
+                "au fichier original.\n"
+                "Le fichier ne doit pas être utilisé."
+            )
+
+        # Le fichier est maintenant considéré comme validé
+        metadata["validated"] = True
+        metadata["actual_sha256"] = actual_hash
+
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f)
+
+        return (
+            "Upload terminé et vérifié avec succès.\n"
+            f"upload_id: {upload_id}\n"
+            f"Fichier: {metadata['filename']}\n"
+            f"Taille: {actual_size} octets\n"
+            f"SHA-256 vérifié: {actual_hash}\n"
+            "Le fichier peut maintenant être utilisé "
+            "comme pièce jointe."
+        )
+
+    except Exception as exc:
+        return (
+            "Erreur pendant la validation de l'upload : "
+            f"{type(exc).__name__}"
+        )
+        
+@mcp.tool()
+def create_draft_with_uploaded_attachments(
+    to: str,
+    subject: str,
+    body: str,
+    upload_ids: list[str],
+    cc: str = ""
+) -> str:
+    """
+    Crée un brouillon IONOS avec un ou plusieurs fichiers
+    précédemment uploadés et validés. N'envoie jamais l'email.
+    """
+
     from email.message import EmailMessage
     from email.utils import formatdate
     import mimetypes
     import time
 
+    if not upload_ids:
+        return "Erreur : aucun fichier fourni."
+
     mail = connect_imap()
 
     try:
-        try:
-            attachment_data = base64.b64decode(file_base64)
-        except Exception:
-            return "Le contenu de la pièce jointe n'est pas un base64 valide."
-
-        if not attachment_data:
-            return "La pièce jointe est vide."
-
-        # Limite : 20 Mo (même limite que create_draft_with_attachments)
-        if len(attachment_data) > 20 * 1024 * 1024:
-            return "Pièce jointe trop volumineuse (limite : 20 Mo)."
-
         msg = EmailMessage()
-
         msg["From"] = EMAIL_USER
         msg["To"] = to
 
@@ -757,19 +981,85 @@ def create_draft_with_upload(
         msg["Date"] = formatdate(localtime=True)
         msg.set_content(body)
 
-        guessed_type = (
-            content_type
-            or mimetypes.guess_type(filename)[0]
-            or "application/octet-stream"
-        )
-        maintype, subtype = guessed_type.split("/", 1)
+        attached_files = []
+        total_size = 0
 
-        msg.add_attachment(
-            attachment_data,
-            maintype=maintype,
-            subtype=subtype,
-            filename=filename
-        )
+        for upload_id in upload_ids:
+
+            if (
+                len(upload_id) != 32
+                or any(c not in "0123456789abcdef" for c in upload_id)
+            ):
+                return f"Erreur : upload_id invalide : {upload_id}"
+
+            session_dir = UPLOAD_DIR / upload_id
+            metadata_path = session_dir / "metadata.json"
+            data_path = session_dir / "data.bin"
+
+            if not metadata_path.exists() or not data_path.exists():
+                return (
+                    "Erreur : fichier uploadé introuvable "
+                    f"ou expiré : {upload_id}"
+                )
+
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+
+            # Refus absolu d'une PJ qui n'a pas passé finish_upload
+            if metadata.get("validated") is not True:
+                return (
+                    f"Erreur : {metadata.get('filename', upload_id)} "
+                    "n'a pas été validé par finish_upload."
+                )
+
+            data = data_path.read_bytes()
+
+            # Nouvelle vérification avant création du brouillon
+            import hashlib
+
+            actual_hash = hashlib.sha256(data).hexdigest()
+
+            if not hmac.compare_digest(
+                actual_hash,
+                metadata["sha256"]
+            ):
+                return (
+                    f"Erreur d'intégrité : "
+                    f"{metadata['filename']}."
+                )
+
+            total_size += len(data)
+
+            # Limite cumulée
+            if total_size > 20 * 1024 * 1024:
+                return (
+                    "Erreur : les pièces jointes dépassent "
+                    "20 Mo au total."
+                )
+
+            filename = metadata["filename"]
+            content_type = metadata.get(
+                "mime_type",
+                "application/octet-stream"
+            )
+
+            # Sécurité si le MIME fourni est incorrect
+            if "/" not in content_type:
+                content_type = (
+                    mimetypes.guess_type(filename)[0]
+                    or "application/octet-stream"
+                )
+
+            maintype, subtype = content_type.split("/", 1)
+
+            msg.add_attachment(
+                data,
+                maintype=maintype,
+                subtype=subtype,
+                filename=filename
+            )
+
+            attached_files.append(filename)
 
         # Recherche du dossier Brouillons
         status, folders = mail.list()
@@ -797,7 +1087,6 @@ def create_draft_with_upload(
         if not draft_folder:
             return "Dossier Brouillons/Drafts introuvable."
 
-        # Enregistrement du brouillon
         status, _ = mail.append(
             draft_folder,
             "\\Draft",
@@ -808,11 +1097,17 @@ def create_draft_with_upload(
         if status != "OK":
             return "IONOS n'a pas pu enregistrer le brouillon."
 
+        files_list = "\n".join(
+            f"- {filename}"
+            for filename in attached_files
+        )
+
         return (
             "Brouillon créé avec succès.\n"
             f"À: {to}\n"
             f"Objet: {subject}\n"
-            f"Pièce jointe: {filename}\n\n"
+            f"Pièces jointes ({len(attached_files)}):\n"
+            f"{files_list}\n\n"
             "Le message n'a PAS été envoyé."
         )
 
